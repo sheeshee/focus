@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# focus - A deep work mode toggle
+#
+# Usage:
+#   focus start [minutes]   Enter focus mode (optional duration in minutes)
+#   focus stop              Exit focus mode
+#   focus status            Check if focus mode is active
+#
+# Configuration:
+#   Set SLACK_TOKEN in ~/.config/focus/config or as an environment variable.
+#   Edit the BLOCKED_DOMAINS array below to customise blocked sites.
+# =============================================================================
+
+# --- Configuration -----------------------------------------------------------
+
+BLOCKED_DOMAINS=(
+    "reddit.com"
+    "www.reddit.com"
+    "old.reddit.com"
+    "news.ycombinator.com"
+    "bbc.co.uk"
+    "www.bbc.co.uk"
+    "bbc.com"
+    "www.bbc.com"
+    "linkedin.com"
+    "www.linkedin.com"
+)
+
+HOSTS_FILE="/etc/hosts"
+FOCUS_MARKER_START="# >>> FOCUS MODE START >>>"
+FOCUS_MARKER_END="# <<< FOCUS MODE END <<<"
+CONFIG_DIR="${HOME}/.config/focus"
+CONFIG_FILE="${CONFIG_DIR}/config"
+PID_FILE="${CONFIG_DIR}/timer.pid"
+
+SLACK_STATUS_TEXT="focus"
+SLACK_STATUS_EMOJI=":technologist:"
+
+# --- Load config -------------------------------------------------------------
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+# --- Helpers -----------------------------------------------------------------
+
+info()  { echo "  ✓ $*"; }
+warn()  { echo "  ⚠ $*"; }
+error() { echo "  ✗ $*" >&2; }
+
+is_active() {
+    grep -q "$FOCUS_MARKER_START" "$HOSTS_FILE" 2>/dev/null
+}
+
+flush_dns() {
+    # macOS DNS cache flush
+    sudo dscacheutil -flushcache
+    sudo killall -HUP mDNSResponder 2>/dev/null || true
+    info "DNS cache flushed"
+}
+
+# --- Hosts file management ---------------------------------------------------
+
+block_sites() {
+    if is_active; then
+        warn "Sites are already blocked"
+        return 0
+    fi
+
+    local block_lines="$FOCUS_MARKER_START"
+    for domain in "${BLOCKED_DOMAINS[@]}"; do
+        block_lines+=$'\n'"127.0.0.1  ${domain}"
+    done
+    block_lines+=$'\n'"$FOCUS_MARKER_END"
+
+    echo "$block_lines" | sudo tee -a "$HOSTS_FILE" > /dev/null
+    info "Blocked ${#BLOCKED_DOMAINS[@]} domains"
+    flush_dns
+}
+
+unblock_sites() {
+    if ! is_active; then
+        warn "Sites are not currently blocked"
+        return 0
+    fi
+
+    # Remove everything between (and including) our markers
+    sudo sed -i '' "/$FOCUS_MARKER_START/,/$FOCUS_MARKER_END/d" "$HOSTS_FILE"
+    info "Unblocked all domains"
+    flush_dns
+}
+
+# --- Slack status ------------------------------------------------------------
+
+set_slack_status() {
+    local text="$1"
+    local emoji="$2"
+
+    if [[ -z "${SLACK_TOKEN:-}" ]]; then
+        warn "SLACK_TOKEN not set — skipping Slack status"
+        return 0
+    fi
+
+    local profile
+    profile=$(printf '{"status_text":"%s","status_emoji":"%s"}' "$text" "$emoji")
+
+    local response
+    response=$(curl -s -X POST "https://slack.com/api/users.profile.set" \
+        -H "Authorization: Bearer ${SLACK_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"profile\": ${profile}}")
+
+    if echo "$response" | grep -q '"ok":true'; then
+        info "Slack status updated"
+    else
+        warn "Slack status update failed — check your token"
+    fi
+}
+
+# --- Timer (optional auto-stop) ----------------------------------------------
+
+start_timer() {
+    local minutes="$1"
+    mkdir -p "$CONFIG_DIR"
+
+    # Kill any existing timer
+    stop_timer 2>/dev/null || true
+
+    (
+        sleep $((minutes * 60))
+        echo ""
+        echo "⏰ Focus session complete (${minutes} minutes)"
+        echo "  Run 'focus stop' to exit focus mode."
+        # Optional: auto-stop. Uncomment the next line if you want it to
+        # automatically disable focus mode when the timer expires.
+        # "$0" stop
+    ) &
+
+    echo $! > "$PID_FILE"
+    info "Timer set for ${minutes} minutes"
+}
+
+stop_timer() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        kill "$pid" 2>/dev/null || true
+        rm -f "$PID_FILE"
+    fi
+}
+
+# --- Commands ----------------------------------------------------------------
+
+cmd_start() {
+    local minutes="${1:-}"
+
+    echo ""
+    echo "🎯 Entering focus mode..."
+    echo ""
+
+    block_sites
+    # set_slack_status "$SLACK_STATUS_TEXT" "$SLACK_STATUS_EMOJI"
+
+    if [[ -n "$minutes" ]]; then
+        start_timer "$minutes"
+    fi
+
+    echo ""
+    echo "  Focus mode is ON. Run 'focus stop' when you're done."
+    echo ""
+}
+
+cmd_stop() {
+    echo ""
+    echo "👋 Exiting focus mode..."
+    echo ""
+
+    unblock_sites
+    # set_slack_status "" ""
+    stop_timer
+
+    echo ""
+    echo "  Focus mode is OFF. Welcome back."
+    echo ""
+}
+
+cmd_status() {
+    echo ""
+    if is_active; then
+        echo "  🎯 Focus mode is ACTIVE"
+        echo ""
+        echo "  Blocked domains:"
+        for domain in "${BLOCKED_DOMAINS[@]}"; do
+            echo "    - ${domain}"
+        done
+    else
+        echo "  Focus mode is OFF"
+    fi
+    echo ""
+}
+
+# --- Main --------------------------------------------------------------------
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    start)  cmd_start "$@" ;;
+    stop)   cmd_stop ;;
+    status) cmd_status ;;
+    *)
+        echo "Usage: focus <start [minutes]|stop|status>"
+        echo ""
+        echo "  start [minutes]  Enter focus mode (optional timer)"
+        echo "  stop             Exit focus mode"
+        echo "  status           Check current state"
+        exit 1
+        ;;
+esac
