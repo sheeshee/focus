@@ -6,6 +6,7 @@ set -euo pipefail
 #
 # Usage:
 #   focus start [minutes]   Enter focus mode (optional duration in minutes)
+#   focus pause <minutes>   Temporarily unblock sites for N minutes
 #   focus stop              Exit focus mode
 #   focus status            Check if focus mode is active
 #
@@ -35,6 +36,7 @@ FOCUS_MARKER_END="# <<< FOCUS MODE END <<<"
 CONFIG_DIR="${HOME}/.config/focus"
 CONFIG_FILE="${CONFIG_DIR}/config"
 PID_FILE="${CONFIG_DIR}/timer.pid"
+PAUSE_PID_FILE="${CONFIG_DIR}/pause.pid"
 
 SLACK_STATUS_TEXT="focus"
 SLACK_STATUS_EMOJI=":technologist:"
@@ -54,6 +56,16 @@ error() { echo "  ✗ $*" >&2; }
 
 is_active() {
     grep -q "$FOCUS_MARKER_START" "$HOSTS_FILE" 2>/dev/null
+}
+
+is_paused() {
+    if [[ -f "$PAUSE_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PAUSE_PID_FILE")
+        kill -0 "$pid" 2>/dev/null
+    else
+        return 1
+    fi
 }
 
 flush_dns() {
@@ -153,6 +165,15 @@ stop_timer() {
     fi
 }
 
+stop_pause_timer() {
+    if [[ -f "$PAUSE_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PAUSE_PID_FILE")
+        kill "$pid" 2>/dev/null || true
+        rm -f "$PAUSE_PID_FILE"
+    fi
+}
+
 # --- Commands ----------------------------------------------------------------
 
 cmd_start() {
@@ -162,6 +183,7 @@ cmd_start() {
     echo "🎯 Entering focus mode..."
     echo ""
 
+    stop_pause_timer
     block_sites
     # set_slack_status "$SLACK_STATUS_TEXT" "$SLACK_STATUS_EMOJI"
 
@@ -179,12 +201,57 @@ cmd_stop() {
     echo "👋 Exiting focus mode..."
     echo ""
 
+    stop_pause_timer
     unblock_sites
     # set_slack_status "" ""
     stop_timer
 
     echo ""
     echo "  Focus mode is OFF. Welcome back."
+    echo ""
+}
+
+cmd_pause() {
+    local minutes="${1:-}"
+
+    if [[ -z "$minutes" ]]; then
+        error "pause requires a duration: focus pause <minutes>"
+        exit 1
+    fi
+
+    if ! is_active && ! is_paused; then
+        error "Focus mode is not active"
+        exit 1
+    fi
+
+    echo ""
+    echo "⏸  Pausing focus mode for ${minutes} minute(s)..."
+    echo ""
+
+    # Cancel any existing pause timer
+    stop_pause_timer
+
+    unblock_sites
+
+    # Refresh sudo credentials now so the background process can re-block
+    # Note: pauses longer than the sudo timeout (~5 min by default) may require
+    # a password prompt when the timer fires.
+    sudo -v
+
+    (
+        sleep $((minutes * 60))
+        echo ""
+        echo "⏰ Pause over — re-enabling focus mode"
+        block_sites
+        rm -f "$PAUSE_PID_FILE"
+    ) &
+
+    mkdir -p "$CONFIG_DIR"
+    echo $! > "$PAUSE_PID_FILE"
+    info "Blocking will resume in ${minutes} minute(s)"
+
+    echo ""
+    echo "  Sites unblocked. Run 'focus stop' to exit focus mode entirely."
     echo ""
 }
 
@@ -197,6 +264,8 @@ cmd_status() {
         for domain in "${BLOCKED_DOMAINS[@]}"; do
             echo "    - ${domain}"
         done
+    elif is_paused; then
+        echo "  ⏸  Focus mode is PAUSED (sites temporarily unblocked)"
     else
         echo "  Focus mode is OFF"
     fi
@@ -210,12 +279,14 @@ shift || true
 
 case "$cmd" in
     start)  cmd_start "$@" ;;
+    pause)  cmd_pause "$@" ;;
     stop)   cmd_stop ;;
     status) cmd_status ;;
     *)
-        echo "Usage: focus <start [minutes]|stop|status>"
+        echo "Usage: focus <start [minutes]|pause <minutes>|stop|status>"
         echo ""
         echo "  start [minutes]  Enter focus mode (optional timer)"
+        echo "  pause <minutes>  Temporarily unblock sites for N minutes"
         echo "  stop             Exit focus mode"
         echo "  status           Check current state"
         exit 1
